@@ -65,6 +65,12 @@ type Game struct {
 	inputBuf        string
 
 	rand *rand.Rand
+	// level progression
+	killCount          int
+	nextLevelThreshold int
+	level              int
+	levelMsg           string
+	levelMsgTimer      float64 // ms
 }
 
 func NewGame() *Game {
@@ -76,6 +82,9 @@ func NewGame() *Game {
 	}
 	// starter tower
 	g.towers = append(g.towers, &Tower{X: 150, Y: 220, Range: 120, Damage: 2, Fire: 700, Cd: 0})
+	// initial level threshold
+	g.nextLevelThreshold = 20 + g.rand.Intn(11) // 20..30
+	g.level = 1
 	return g
 }
 
@@ -223,7 +232,23 @@ func (g *Game) Update() error {
 	// remove dead enemies
 	for i := len(g.enemies) - 1; i >= 0; i-- {
 		if g.enemies[i].HP <= 0 {
+			// count kills
+			g.killCount++
+			// remove
 			g.enemies = append(g.enemies[:i], g.enemies[i+1:]...)
+			// check for new level
+			if g.killCount >= g.nextLevelThreshold {
+				g.newLevel()
+			}
+		}
+	}
+
+	// decrement level message timer
+	if g.levelMsgTimer > 0 {
+		g.levelMsgTimer -= dt
+		if g.levelMsgTimer < 0 {
+			g.levelMsgTimer = 0
+			g.levelMsg = ""
 		}
 	}
 
@@ -270,16 +295,16 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	}
 
 	// UI text
-	text.Draw(screen, "Press C to open math challenge", basicfont.Face7x13, 10, 20, color.White)
+	drawText(screen, "Press C to open math challenge", 10, 20, color.White)
 	if g.selected >= 0 {
 		tw := g.towers[g.selected]
-		text.Draw(screen, fmt.Sprintf("Selected Tower: dmg=%.0f range=%.0f fire=%.0fms", tw.Damage, tw.Range, tw.Fire), basicfont.Face7x13, 10, 40, color.White)
+		drawText(screen, fmt.Sprintf("Selected Tower: dmg=%.0f range=%.0f fire=%.0fms", tw.Damage, tw.Range, tw.Fire), 10, 40, color.White)
 	}
-	text.Draw(screen, "Click to select a tower or set place point. Press C for challenge.", basicfont.Face7x13, 10, 60, color.White)
+	drawText(screen, "Click to select a tower or set place point. Press C for challenge.", 10, 60, color.White)
 
 	// last click indicator
 	if g.selected == -1 {
-		text.Draw(screen, fmt.Sprintf("Placement point: %.0f, %.0f (click then press C)", g.lastClick.X, g.lastClick.Y), basicfont.Face7x13, 10, 80, color.White)
+		drawText(screen, fmt.Sprintf("Placement point: %.0f, %.0f (click then press C)", g.lastClick.X, g.lastClick.Y), 10, 80, color.White)
 	}
 
 	// challenge overlay
@@ -288,11 +313,21 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		w := 500.0
 		h := 140.0
 		rect(screen, (ScreenW-w)/2, (ScreenH-h)/2, w, h, color.RGBA{0, 0, 0, 0x80})
-		text.Draw(screen, "Solve:", basicfont.Face7x13, int((ScreenW-w)/2+20), int((ScreenH-h)/2+30), color.White)
-		text.Draw(screen, g.question.Text, basicfont.Face7x13, int((ScreenW-w)/2+20), int((ScreenH-h)/2+60), color.White)
-		text.Draw(screen, "Answer: "+g.inputBuf, basicfont.Face7x13, int((ScreenW-w)/2+20), int((ScreenH-h)/2+90), color.White)
-		text.Draw(screen, "Enter to submit, Esc to cancel", basicfont.Face7x13, int((ScreenW-w)/2+20), int((ScreenH-h)/2+120), color.White)
+		drawText(screen, "Solve:", int((ScreenW-w)/2+20), int((ScreenH-h)/2+30), color.White)
+		drawText(screen, g.question.Text, int((ScreenW-w)/2+20), int((ScreenH-h)/2+60), color.White)
+		drawText(screen, "Answer: "+g.inputBuf, int((ScreenW-w)/2+20), int((ScreenH-h)/2+90), color.White)
+		drawText(screen, "Enter to submit, Esc to cancel", int((ScreenW-w)/2+20), int((ScreenH-h)/2+120), color.White)
 	}
+
+	// level message
+	if g.levelMsgTimer > 0 && g.levelMsg != "" {
+		drawText(screen, g.levelMsg, 10, ScreenH-20, color.White)
+	}
+}
+
+// drawText is a small wrapper that uses the classic text.Draw signature
+func drawText(img *ebiten.Image, s string, x, y int, col color.Color) {
+	text.Draw(img, s, basicfont.Face7x13, x, y, col)
 }
 
 func (g *Game) spawnEnemy() {
@@ -330,6 +365,32 @@ func (g *Game) applyReward() {
 		}
 		g.towers = append(g.towers, &Tower{X: pos.X, Y: pos.Y, Range: 120, Damage: 2, Fire: 700, Cd: 0})
 	}
+}
+
+func (g *Game) newLevel() {
+	g.level++
+	g.killCount = 0
+	g.nextLevelThreshold = 20 + g.rand.Intn(11)
+	// generate a new random path with 5-7 waypoints across the screen
+	wp := 3 + g.rand.Intn(5) // 3..7 segments
+	newPath := make([]Vec, 0, wp+2)
+	// start at left edge
+	newPath = append(newPath, Vec{0, 300})
+	for i := 0; i < wp; i++ {
+		x := float64(100 + g.rand.Intn(ScreenW-200))
+		y := float64(80 + g.rand.Intn(ScreenH-160))
+		newPath = append(newPath, Vec{x, y})
+	}
+	// end at right edge
+	newPath = append(newPath, Vec{ScreenW, 300})
+	g.path = newPath
+	// reduce spawn interval slightly to increase challenge
+	if g.spawnInt > 600 {
+		g.spawnInt -= 150
+	}
+	// set a temporary level message
+	g.levelMsg = fmt.Sprintf("Level %d - New path generated! Next threshold: %d kills", g.level, g.nextLevelThreshold)
+	g.levelMsgTimer = 3000 // show for 3s
 }
 
 func genQuestion(r *rand.Rand) *Question {

@@ -9,7 +9,7 @@ Run
 From PowerShell:
 
 ```powershell
-cd "C:\Users\username\Desktop\datagame-go"
+cd "C:\Users\End User\Desktop\datagame-go"
 go mod tidy
 go run .
 ```
@@ -23,4 +23,3 @@ Next steps you might want
 - Add money/score system and a shop
 - Improve graphics and animations
 - Add sound effects and more question difficulties
-

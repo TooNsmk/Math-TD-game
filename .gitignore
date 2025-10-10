@@ -1,0 +1,24 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# build output
+bin/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Go
+vendor/
+*.log
+
+# Ignore editor swap/temp files
+*~
+*.swp
