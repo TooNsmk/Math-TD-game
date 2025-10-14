@@ -26,6 +26,12 @@ type Enemy struct {
 	MaxHP float64
 	Speed float64 // px/sec
 	T     float64 // progress along path
+	// status effects
+	BurnTime   float64 // ms remaining
+	BurnLevel  int     // damage multiplier level for burn
+	BurnTick   float64 // accumulator for burn tick interval (ms)
+	SlowTime   float64 // ms remaining for slow
+	SlowFactor float64 // multiplier applied to speed when slowed (0-1)
 }
 
 type Tower struct {
@@ -34,6 +40,10 @@ type Tower struct {
 	Damage float64
 	Fire   float64 // ms
 	Cd     float64
+	Type   string // "normal", "flame", "slow"
+	// optional for special towers
+	FlameDuration float64 // ms that a flame effect lasts on target when hit
+	PulseDuration float64 // ms that a slow pulse lasts on enemy
 }
 
 type Bullet struct {
@@ -81,7 +91,11 @@ func NewGame() *Game {
 		rand:     rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 	// starter tower
-	g.towers = append(g.towers, &Tower{X: 150, Y: 220, Range: 120, Damage: 2, Fire: 700, Cd: 0})
+	g.towers = append(g.towers, &Tower{X: 150, Y: 220, Range: 120, Damage: 2, Fire: 700, Cd: 0, Type: "normal"})
+	// flame tower
+	g.towers = append(g.towers, &Tower{X: 300, Y: 220, Range: 100, Damage: 0, Fire: 200, Cd: 0, Type: "flame", FlameDuration: 5000})
+	// slowing tower (pulse)
+	g.towers = append(g.towers, &Tower{X: 450, Y: 220, Range: 140, Damage: 0, Fire: 1500, Cd: 0, Type: "slow", PulseDuration: 1200})
 	// initial level threshold
 	g.nextLevelThreshold = 20 + g.rand.Intn(11) // 20..30
 	g.level = 1
@@ -201,7 +215,48 @@ func (g *Game) Update() error {
 				p := g.posAlongPath(target.T)
 				// fire
 				tw.Cd = tw.Fire
-				g.bullets = append(g.bullets, &Bullet{X: tw.X, Y: tw.Y, Tx: p.X, Ty: p.Y, Speed: 400, Damage: tw.Damage})
+				if tw.Type == "flame" {
+					// flamethrower: apply burn status to target
+					target.BurnTime = math.Max(target.BurnTime, tw.FlameDuration)
+					// burn level scales with game level
+					target.BurnLevel = g.level
+					// also create short lived visual bullet for flame
+					g.bullets = append(g.bullets, &Bullet{X: tw.X, Y: tw.Y, Tx: p.X, Ty: p.Y, Speed: 800, Damage: 0})
+				} else if tw.Type == "slow" {
+					// apply slow pulse
+					target.SlowTime = math.Max(target.SlowTime, tw.PulseDuration)
+					// slow factor scales with tower damage field (if any), default 0.5
+					target.SlowFactor = 0.5
+					g.bullets = append(g.bullets, &Bullet{X: tw.X, Y: tw.Y, Tx: p.X, Ty: p.Y, Speed: 600, Damage: 0})
+				} else {
+					g.bullets = append(g.bullets, &Bullet{X: tw.X, Y: tw.Y, Tx: p.X, Ty: p.Y, Speed: 400, Damage: tw.Damage})
+				}
+			}
+		}
+	}
+
+	// process enemy status effects (burn damage over time, slow timers)
+	for _, e := range g.enemies {
+		// burn: deal damage per tick (1000ms tick) scaled by level
+		if e.BurnTime > 0 {
+			e.BurnTick += dt
+			for e.BurnTick >= 1000 {
+				// each tick deals 10 damage * level
+				dmg := float64(10 * e.BurnLevel)
+				e.HP -= dmg
+				e.BurnTick -= 1000
+			}
+			e.BurnTime -= dt
+			if e.BurnTime < 0 {
+				e.BurnTime = 0
+			}
+		}
+		// slow: decrement timer
+		if e.SlowTime > 0 {
+			e.SlowTime -= dt
+			if e.SlowTime < 0 {
+				e.SlowTime = 0
+				e.SlowFactor = 1.0
 			}
 		}
 	}
@@ -331,7 +386,9 @@ func drawText(img *ebiten.Image, s string, x, y int, col color.Color) {
 }
 
 func (g *Game) spawnEnemy() {
-	e := &Enemy{HP: 5 + float64(g.rand.Intn(6)), MaxHP: 5, Speed: 40 + g.rand.Float64()*40, T: 0}
+	// scale HP between 100 and 1000 based on level randomness
+	hp := 100.0 + g.rand.Float64()*(1000.0-100.0)
+	e := &Enemy{HP: hp, MaxHP: hp, Speed: 40 + g.rand.Float64()*40, T: 0}
 	g.enemies = append(g.enemies, e)
 }
 
