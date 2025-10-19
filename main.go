@@ -24,6 +24,7 @@ type Vec struct{ X, Y float64 }
 type Enemy struct {
 	HP    float64
 	MaxHP float64
+	Armor float64
 	Speed float64 // px/sec
 	T     float64 // progress along path
 	// status effects
@@ -47,10 +48,12 @@ type Tower struct {
 }
 
 type Bullet struct {
-	X, Y   float64
-	Tx, Ty float64
-	Speed  float64
-	Damage float64
+	X, Y        float64
+	Tx, Ty      float64
+	Speed       float64
+	Damage      float64
+	Penetration float64
+	AoeRadius   float64
 }
 
 type Question struct {
@@ -81,6 +84,17 @@ type Game struct {
 	level              int
 	levelMsg           string
 	levelMsgTimer      float64 // ms
+	// player stats
+	playerHP    float64
+	playerArmor float64
+	playerGold  int
+	// shop / upgrades
+	shopActive bool
+	// upgrade levels
+	upDamageLevel int
+	upSpeedLevel  int
+	upPenLevel    int
+	upAOELevel    int
 }
 
 func NewGame() *Game {
@@ -99,6 +113,16 @@ func NewGame() *Game {
 	// initial level threshold
 	g.nextLevelThreshold = 20 + g.rand.Intn(11) // 20..30
 	g.level = 1
+	// player defaults
+	g.playerHP = 100.0
+	g.playerArmor = 2.0
+	g.playerGold = 0
+	// upgrades
+	g.shopActive = false
+	g.upDamageLevel = 0
+	g.upSpeedLevel = 0
+	g.upPenLevel = 0
+	g.upAOELevel = 0
 	return g
 }
 
@@ -112,6 +136,10 @@ func (g *Game) Update() error {
 		x, y := ebiten.CursorPosition()
 		gx := float64(x)
 		gy := float64(y)
+		// if shop active, handle purchase clicks
+		if g.shopActive {
+			g.handleShopClick(gx, gy)
+		}
 		// select near tower
 		sel := -1
 		for i, tw := range g.towers {
@@ -134,6 +162,15 @@ func (g *Game) Update() error {
 		g.question = q
 		g.inputBuf = ""
 		g.challengeActive = true
+	}
+
+	// toggle shop with B key
+	if inpututil.IsKeyJustPressed(ebiten.KeyB) {
+		g.shopActive = !g.shopActive
+		// close challenge if shop opened
+		if g.shopActive {
+			g.challengeActive = false
+		}
 	}
 
 	// while challenge active, capture numeric keys, backspace and enter
@@ -189,8 +226,14 @@ func (g *Game) Update() error {
 		frac := (e.Speed * dt / 1000.0) / (segLen)
 		e.T += frac
 		if e.T >= float64(len(g.path)-1) {
-			// reached end
-			// remove
+			// reached end -> enemy escaped: damage the player (armor mitigates flat damage)
+			baseDmg := 10.0
+			mitig := baseDmg - g.playerArmor
+			if mitig < 1.0 {
+				mitig = 1.0
+			}
+			g.playerHP -= mitig
+			// remove enemy
 			g.enemies = append(g.enemies[:i], g.enemies[i+1:]...)
 			continue
 		}
@@ -221,15 +264,31 @@ func (g *Game) Update() error {
 					// burn level scales with game level
 					target.BurnLevel = g.level
 					// also create short lived visual bullet for flame
-					g.bullets = append(g.bullets, &Bullet{X: tw.X, Y: tw.Y, Tx: p.X, Ty: p.Y, Speed: 800, Damage: 0})
+					dmg := 100.0
+					// damage multiplier from upgrades: 10% per level
+					dmg *= 1.0 + 0.10*float64(g.upDamageLevel)
+					pen := float64(g.upPenLevel)
+					aoe := 0.0 + 4.0*float64(g.upAOELevel)
+					g.bullets = append(g.bullets, &Bullet{X: tw.X, Y: tw.Y, Tx: p.X, Ty: p.Y, Speed: 800, Damage: dmg, Penetration: pen, AoeRadius: aoe})
 				} else if tw.Type == "slow" {
 					// apply slow pulse
 					target.SlowTime = math.Max(target.SlowTime, tw.PulseDuration)
 					// slow factor scales with tower damage field (if any), default 0.5
 					target.SlowFactor = 0.5
-					g.bullets = append(g.bullets, &Bullet{X: tw.X, Y: tw.Y, Tx: p.X, Ty: p.Y, Speed: 600, Damage: 0})
+					dmg := 100.0
+					dmg *= 1.0 + 0.10*float64(g.upDamageLevel)
+					pen := float64(g.upPenLevel)
+					aoe := 0.0 + 4.0*float64(g.upAOELevel)
+					g.bullets = append(g.bullets, &Bullet{X: tw.X, Y: tw.Y, Tx: p.X, Ty: p.Y, Speed: 600, Damage: dmg, Penetration: pen, AoeRadius: aoe})
 				} else {
-					g.bullets = append(g.bullets, &Bullet{X: tw.X, Y: tw.Y, Tx: p.X, Ty: p.Y, Speed: 400, Damage: tw.Damage})
+					// base damage adjusted by tower damage and upgrades
+					base := tw.Damage
+					base *= 1.0 + 0.10*float64(g.upDamageLevel)
+					// fire rate speedup: each speed level reduces Fire by 10%
+					tw.Fire = tw.Fire * math.Pow(0.90, float64(g.upSpeedLevel))
+					pen := float64(g.upPenLevel)
+					aoe := 0.0 + 4.0*float64(g.upAOELevel)
+					g.bullets = append(g.bullets, &Bullet{X: tw.X, Y: tw.Y, Tx: p.X, Ty: p.Y, Speed: 400, Damage: base, Penetration: pen, AoeRadius: aoe})
 				}
 			}
 		}
@@ -242,7 +301,7 @@ func (g *Game) Update() error {
 			e.BurnTick += dt
 			for e.BurnTick >= 1000 {
 				// each tick deals 10 damage * level
-				dmg := float64(10 * e.BurnLevel)
+				dmg := float64(100 * e.BurnLevel)
 				e.HP -= dmg
 				e.BurnTick -= 1000
 			}
@@ -269,14 +328,8 @@ func (g *Game) Update() error {
 		d := math.Hypot(dx, dy)
 		move := b.Speed * dt / 1000.0
 		if d <= move || d == 0 {
-			// apply to nearest enemy at that position (simple)
-			for j := range g.enemies {
-				p := g.posAlongPath(g.enemies[j].T)
-				if math.Hypot(p.X-b.Tx, p.Y-b.Ty) < 18 {
-					g.enemies[j].HP -= b.Damage
-					break
-				}
-			}
+			// apply damage at impact point, considering penetration and AoE
+			g.applyDamageAt(b.Tx, b.Ty, b.Damage, b.Penetration, b.AoeRadius)
 			g.bullets = append(g.bullets[:i], g.bullets[i+1:]...)
 			continue
 		}
@@ -289,6 +342,9 @@ func (g *Game) Update() error {
 		if g.enemies[i].HP <= 0 {
 			// count kills
 			g.killCount++
+			// award gold: multiples of 10. Use current killCount as multiplier (e.g., 1st kill = 10, 2nd = 20...)
+			goldAward := 10 * g.killCount
+			g.playerGold += goldAward
 			// remove
 			g.enemies = append(g.enemies[:i], g.enemies[i+1:]...)
 			// check for new level
@@ -324,7 +380,33 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	// enemies
 	for _, e := range g.enemies {
 		p := g.posAlongPath(e.T)
-		ebitenutilFillCircle(screen, p.X, p.Y, 12, color.RGBA{0xD9, 0x53, 0x4F, 0xFF})
+		// visual tinting: burning -> reddish, slowed -> bluish
+		col := color.RGBA{0xD9, 0x53, 0x4F, 0xFF}
+		if e.BurnTime > 0 {
+			// stronger red when burn active
+			col = color.RGBA{0xFF, 0x88, 0x66, 0xFF}
+		}
+		if e.SlowTime > 0 {
+			// mix with blue tint when slowed
+			col = color.RGBA{0x66, 0x99, 0xFF, 0xFF}
+		}
+		ebitenutilFillCircle(screen, p.X, p.Y, 12, col)
+
+		// flame particles for burning enemies
+		if e.BurnTime > 0 {
+			// draw a few small flicker rects above the enemy
+			for i := 0; i < 6; i++ {
+				offx := (float64(i)-3.0)*2.0 + math.Sin(float64(i)+e.BurnTick/50.0)*2.0
+				offy := -6.0 + math.Mod(e.BurnTick/100.0, 6.0)
+				rect(screen, p.X+offx, p.Y+offy, 3, 3, color.RGBA{0xFF, 0x66, 0x00, 0xFF})
+			}
+		}
+
+		// slow ring indicator
+		if e.SlowTime > 0 {
+			ringR := 18.0 + (e.SlowTime/1000.0)*6.0
+			rect(screen, p.X-ringR/2, p.Y-ringR/2, ringR, 2, color.RGBA{0x66, 0x99, 0xFF, 0x80})
+		}
 		// hp bar
 		barW := 30.0
 		healthW := barW * (e.HP / e.MaxHP)
@@ -351,6 +433,10 @@ func (g *Game) Draw(screen *ebiten.Image) {
 
 	// UI text
 	drawText(screen, "Press C to open math challenge", 10, 20, color.White)
+	// player stats
+	drawText(screen, fmt.Sprintf("HP: %.0f", g.playerHP), ScreenW-180, 20, color.White)
+	drawText(screen, fmt.Sprintf("Armor: %.0f", g.playerArmor), ScreenW-180, 40, color.White)
+	drawText(screen, fmt.Sprintf("Gold: %d", g.playerGold), ScreenW-180, 60, color.White)
 	if g.selected >= 0 {
 		tw := g.towers[g.selected]
 		drawText(screen, fmt.Sprintf("Selected Tower: dmg=%.0f range=%.0f fire=%.0fms", tw.Damage, tw.Range, tw.Fire), 10, 40, color.White)
@@ -374,6 +460,34 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		drawText(screen, "Enter to submit, Esc to cancel", int((ScreenW-w)/2+20), int((ScreenH-h)/2+120), color.White)
 	}
 
+	// shop overlay
+	if g.shopActive {
+		w := 420.0
+		h := 260.0
+		x0 := (ScreenW - int(w)) / 2
+		y0 := (ScreenH - int(h)) / 2
+		rect(screen, float64(x0), float64(y0), w, h, color.RGBA{0, 0, 0, 0xC0})
+		drawText(screen, "Shop - Buy Upgrades (press B to close)", x0+10, y0+20, color.White)
+		drawText(screen, fmt.Sprintf("Gold: %d", g.playerGold), x0+300, y0+20, color.White)
+
+		// each upgrade line: label (x,y) and cost and level
+		lines := []struct {
+			label string
+			level int
+			cost  int
+		}{
+			{"Damage +10%", g.upDamageLevel, 50 * (1 + g.upDamageLevel)},
+			{"Fire Rate +10%", g.upSpeedLevel, 40 * (1 + g.upSpeedLevel)},
+			{"Armor Penetration +1", g.upPenLevel, 60 * (1 + g.upPenLevel)},
+			{"AOE Radius +4px", g.upAOELevel, 80 * (1 + g.upAOELevel)},
+		}
+		for i, l := range lines {
+			yy := y0 + 50 + i*40
+			drawText(screen, fmt.Sprintf("%s (Lv %d) - Cost: %d", l.label, l.level, l.cost), x0+10, yy, color.White)
+			drawText(screen, "Click to buy", x0+300, yy, color.White)
+		}
+	}
+
 	// level message
 	if g.levelMsgTimer > 0 && g.levelMsg != "" {
 		drawText(screen, g.levelMsg, 10, ScreenH-20, color.White)
@@ -388,8 +502,93 @@ func drawText(img *ebiten.Image, s string, x, y int, col color.Color) {
 func (g *Game) spawnEnemy() {
 	// scale HP between 100 and 1000 based on level randomness
 	hp := 100.0 + g.rand.Float64()*(1000.0-100.0)
-	e := &Enemy{HP: hp, MaxHP: hp, Speed: 40 + g.rand.Float64()*40, T: 0}
+	// give enemies a small armor that scales with level
+	armor := float64(g.level) * 0.5
+	e := &Enemy{HP: hp, MaxHP: hp, Armor: armor, Speed: 40 + g.rand.Float64()*40, T: 0}
 	g.enemies = append(g.enemies, e)
+}
+
+// handleShopClick checks if the click was on a shop button and purchases if affordable
+func (g *Game) handleShopClick(x, y float64) {
+	w := 420.0
+	h := 260.0
+	x0 := float64((ScreenW - int(w)) / 2)
+	y0 := float64((ScreenH - int(h)) / 2)
+	if x < x0 || x > x0+w || y < y0 || y > y0+h {
+		return
+	}
+	// compute which line clicked
+	relY := int(y - (y0 + 50))
+	if relY < 0 || relY > 200 {
+		return
+	}
+	idx := relY / 40
+	switch idx {
+	case 0:
+		cost := 50 * (1 + g.upDamageLevel)
+		if g.playerGold >= cost {
+			g.playerGold -= cost
+			g.upDamageLevel++
+		}
+	case 1:
+		cost := 40 * (1 + g.upSpeedLevel)
+		if g.playerGold >= cost {
+			g.playerGold -= cost
+			g.upSpeedLevel++
+		}
+	case 2:
+		cost := 60 * (1 + g.upPenLevel)
+		if g.playerGold >= cost {
+			g.playerGold -= cost
+			g.upPenLevel++
+		}
+	case 3:
+		cost := 80 * (1 + g.upAOELevel)
+		if g.playerGold >= cost {
+			g.playerGold -= cost
+			g.upAOELevel++
+		}
+	}
+}
+
+// applyDamageAt applies damage to an enemy index or AoE around a point, considering penetration and enemy armor
+func (g *Game) applyDamageAt(x, y, baseDamage float64, penetration float64, aoeRadius float64) {
+	if aoeRadius <= 0 {
+		// find nearest enemy at point
+		best := -1
+		bestD := 1e9
+		for i, e := range g.enemies {
+			p := g.posAlongPath(e.T)
+			d := math.Hypot(p.X-x, p.Y-y)
+			if d < bestD {
+				bestD = d
+				best = i
+			}
+		}
+		if best >= 0 && bestD < 18 {
+			e := g.enemies[best]
+			// effective armor after penetration
+			effArmor := math.Max(0, e.Armor-penetration)
+			dmg := baseDamage - effArmor
+			if dmg < 1 {
+				dmg = 1
+			}
+			e.HP -= dmg
+		}
+		return
+	}
+	// AoE: damage all enemies within radius
+	for _, e := range g.enemies {
+		p := g.posAlongPath(e.T)
+		if math.Hypot(p.X-x, p.Y-y) <= aoeRadius {
+			effArmor := math.Max(0, e.Armor-penetration)
+			dmg := baseDamage - effArmor
+			if dmg < 1 {
+				dmg = 1
+			}
+			e.HP -= dmg
+		}
+	}
 }
 
 func (g *Game) posAlongPath(t float64) Vec {
