@@ -19,6 +19,34 @@ const (
 	ScreenH = 600
 )
 
+// --- tuning constants for enemy scaling and waves ---
+const (
+	// enemy HP base range (float)
+	EnemyBaseHPMin = 100.0
+	EnemyBaseHPMax = 200.0
+	// per-level HP scale factor applied to base: hp = base * (1 + (level-1)*EnemyHPScalePerLevel)
+	EnemyHPScalePerLevel = 0.18
+	// armor added per level
+	EnemyArmorPerLevel = 0.5
+	// speed base and random range, and incremental speed per level
+	EnemySpeedBase     = 10.0
+	EnemySpeedRandMax  = 40.0
+	EnemySpeedPerLevel = 2.0
+	// enemies per level (inclusive range)
+	EnemiesPerLevelMin = 30
+	EnemiesPerLevelMax = 50
+	// spawn interval base (ms) and how much it reduces per level
+	SpawnIntervalBase  = 2000.0
+	SpawnIntervalDecay = 150.0
+	// minimum spawn interval allowed
+	SpawnIntervalMin = 600.0
+	// player escape base damage before armor mitigation
+	PlayerEscapeBaseDamage = 10.0
+)
+
+// inter-level pause (ms)
+const InterLevelPauseMS = 20000.0
+
 type Vec struct{ X, Y float64 }
 
 type Enemy struct {
@@ -84,6 +112,9 @@ type Game struct {
 	level              int
 	levelMsg           string
 	levelMsgTimer      float64 // ms
+	// per-level spawn control
+	enemiesToSpawn int
+	enemiesSpawned int
 	// player stats
 	playerHP    float64
 	playerArmor float64
@@ -95,12 +126,15 @@ type Game struct {
 	upSpeedLevel  int
 	upPenLevel    int
 	upAOELevel    int
+	// inter-level pause
+	interLevelActive bool
+	interLevelTimer  float64 // ms
 }
 
 func NewGame() *Game {
 	g := &Game{
 		path:     []Vec{{0, 300}, {200, 300}, {200, 100}, {600, 100}, {600, 400}, {800, 400}},
-		spawnInt: 2000,
+		spawnInt: SpawnIntervalBase,
 		selected: -1,
 		rand:     rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
@@ -113,6 +147,12 @@ func NewGame() *Game {
 	// initial level threshold
 	g.nextLevelThreshold = 20 + g.rand.Intn(11) // 20..30
 	g.level = 1
+	// per-level spawn targets
+	g.enemiesToSpawn = EnemiesPerLevelMin + g.rand.Intn(EnemiesPerLevelMax-EnemiesPerLevelMin+1)
+	g.enemiesSpawned = 0
+	// do not start an inter-level pause at game start; first level should begin immediately
+	g.interLevelActive = false
+	g.interLevelTimer = 0
 	// player defaults
 	g.playerHP = 100.0
 	g.playerArmor = 2.0
@@ -136,6 +176,10 @@ func (g *Game) Update() error {
 		x, y := ebiten.CursorPosition()
 		gx := float64(x)
 		gy := float64(y)
+		// if inter-level pause active, handle its clicks (Start now button)
+		if g.interLevelActive {
+			g.handleInterLevelClick(gx, gy)
+		}
 		// if shop active, handle purchase clicks
 		if g.shopActive {
 			g.handleShopClick(gx, gy)
@@ -158,7 +202,7 @@ func (g *Game) Update() error {
 
 	// toggle challenge with C key
 	if inpututil.IsKeyJustPressed(ebiten.KeyC) && !g.challengeActive {
-		q := genQuestion(g.rand)
+		q := genQuestion(g.rand, g.level)
 		g.question = q
 		g.inputBuf = ""
 		g.challengeActive = true
@@ -208,11 +252,31 @@ func (g *Game) Update() error {
 		}
 	}
 
-	// spawn
-	g.lastSpawn += dt
-	if g.lastSpawn > g.spawnInt {
-		g.spawnEnemy()
-		g.lastSpawn = 0
+	// inter-level pause handling
+	if g.interLevelActive {
+		g.interLevelTimer -= dt
+		if g.interLevelTimer <= 0 {
+			g.interLevelActive = false
+			g.interLevelTimer = 0
+			// reset spawn counters for the level
+			g.enemiesSpawned = 0
+			g.lastSpawn = 0
+		}
+	} else {
+		// spawn: only while we haven't spawned the per-level total
+		g.lastSpawn += dt
+		if g.enemiesSpawned < g.enemiesToSpawn {
+			if g.lastSpawn > g.spawnInt {
+				g.spawnEnemy()
+				g.enemiesSpawned++
+				g.lastSpawn = 0
+			}
+		} else {
+			// if we've spawned all for this level and there are no enemies left, advance
+			if len(g.enemies) == 0 {
+				g.newLevel()
+			}
+		}
 	}
 
 	// update enemies
@@ -227,8 +291,7 @@ func (g *Game) Update() error {
 		e.T += frac
 		if e.T >= float64(len(g.path)-1) {
 			// reached end -> enemy escaped: damage the player (armor mitigates flat damage)
-			baseDmg := 10.0
-			mitig := baseDmg - g.playerArmor
+			mitig := PlayerEscapeBaseDamage - g.playerArmor
 			if mitig < 1.0 {
 				mitig = 1.0
 			}
@@ -437,6 +500,13 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	drawText(screen, fmt.Sprintf("HP: %.0f", g.playerHP), ScreenW-180, 20, color.White)
 	drawText(screen, fmt.Sprintf("Armor: %.0f", g.playerArmor), ScreenW-180, 40, color.White)
 	drawText(screen, fmt.Sprintf("Gold: %d", g.playerGold), ScreenW-180, 60, color.White)
+	// level and remaining enemies
+	remaining := (g.enemiesToSpawn - g.enemiesSpawned)
+	if remaining < 0 {
+		remaining = 0
+	}
+	remaining += len(g.enemies)
+	drawText(screen, fmt.Sprintf("Level: %d  Remaining: %d", g.level, remaining), ScreenW/2-80, 20, color.White)
 	if g.selected >= 0 {
 		tw := g.towers[g.selected]
 		drawText(screen, fmt.Sprintf("Selected Tower: dmg=%.0f range=%.0f fire=%.0fms", tw.Damage, tw.Range, tw.Fire), 10, 40, color.White)
@@ -492,6 +562,39 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	if g.levelMsgTimer > 0 && g.levelMsg != "" {
 		drawText(screen, g.levelMsg, 10, ScreenH-20, color.White)
 	}
+
+	// inter-level large countdown
+	if g.interLevelActive {
+		secs := int(math.Ceil(g.interLevelTimer / 1000.0))
+		msg := fmt.Sprintf("Level %d starting in %d", g.level, secs)
+		// centered large text box
+		w := 360.0
+		h := 80.0
+		rect(screen, (ScreenW-w)/2, (ScreenH-h)/2, w, h, color.RGBA{0, 0, 0, 0xC0})
+		drawText(screen, msg, int((ScreenW-w)/2+20), int((ScreenH-h)/2+30), color.White)
+		// draw Start Now button with hover/pressed feedback
+		bx := float64((ScreenW-int(w))/2 + int(w) - 120)
+		by := float64((ScreenH-int(h))/2 + int(h) - 36)
+		bw := 100.0
+		bh := 28.0
+		// detect cursor over button
+		mx, my := ebiten.CursorPosition()
+		over := float64(mx) >= bx && float64(mx) <= bx+bw && float64(my) >= by && float64(my) <= by+bh
+		// pressed state
+		pressed := over && ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft)
+		btnCol := color.RGBA{0x33, 0x99, 0x33, 0xFF} // normal
+		if over {
+			btnCol = color.RGBA{0x44, 0xB2, 0x44, 0xFF} // hover
+		}
+		if pressed {
+			btnCol = color.RGBA{0x22, 0x66, 0x22, 0xFF} // pressed
+		}
+		rect(screen, bx, by, bw, bh, btnCol)
+		// subtle border
+		rect(screen, bx-1, by-1, bw+2, 1, color.RGBA{0x00, 0x00, 0x00, 0x60})
+		rect(screen, bx-1, by+bh, bw+2, 1, color.RGBA{0x00, 0x00, 0x00, 0x60})
+		drawText(screen, "Start level now", int(bx+8), int(by+18), color.White)
+	}
 }
 
 // drawText is a small wrapper that uses the classic text.Draw signature
@@ -500,11 +603,15 @@ func drawText(img *ebiten.Image, s string, x, y int, col color.Color) {
 }
 
 func (g *Game) spawnEnemy() {
-	// scale HP between 100 and 1000 based on level randomness
-	hp := 100.0 + g.rand.Float64()*(1000.0-100.0)
+	// base hp grows with level; early levels weaker, later levels stronger
+	base := EnemyBaseHPMin + g.rand.Float64()*(EnemyBaseHPMax-EnemyBaseHPMin)
+	// scale up with level
+	hp := base * (1.0 + float64(g.level-1)*EnemyHPScalePerLevel)
 	// give enemies a small armor that scales with level
-	armor := float64(g.level) * 0.5
-	e := &Enemy{HP: hp, MaxHP: hp, Armor: armor, Speed: 40 + g.rand.Float64()*40, T: 0}
+	armor := float64(g.level) * EnemyArmorPerLevel
+	// slightly increase speed with level for later waves
+	speed := EnemySpeedBase + g.rand.Float64()*EnemySpeedRandMax + float64(g.level-1)*EnemySpeedPerLevel
+	e := &Enemy{HP: hp, MaxHP: hp, Armor: armor, Speed: speed, T: 0}
 	g.enemies = append(g.enemies, e)
 }
 
@@ -548,6 +655,26 @@ func (g *Game) handleShopClick(x, y float64) {
 			g.playerGold -= cost
 			g.upAOELevel++
 		}
+	}
+}
+
+// handleInterLevelClick checks clicks on the inter-level Start Now button
+func (g *Game) handleInterLevelClick(x, y float64) {
+	if !g.interLevelActive {
+		return
+	}
+	w := 360.0
+	h := 80.0
+	bx := float64((ScreenW-int(w))/2 + int(w) - 120)
+	by := float64((ScreenH-int(h))/2 + int(h) - 36)
+	bw := 100.0
+	bh := 28.0
+	if x >= bx && x <= bx+bw && y >= by && y <= by+bh {
+		// start immediately
+		g.interLevelActive = false
+		g.interLevelTimer = 0
+		g.enemiesSpawned = 0
+		g.lastSpawn = 0
 	}
 }
 
@@ -627,6 +754,9 @@ func (g *Game) newLevel() {
 	g.level++
 	g.killCount = 0
 	g.nextLevelThreshold = 20 + g.rand.Intn(11)
+	// set new per-level spawn target
+	g.enemiesToSpawn = EnemiesPerLevelMin + g.rand.Intn(EnemiesPerLevelMax-EnemiesPerLevelMin+1)
+	g.enemiesSpawned = 0
 	// generate a new random path with 5-7 waypoints across the screen
 	wp := 3 + g.rand.Intn(5) // 3..7 segments
 	newPath := make([]Vec, 0, wp+2)
@@ -641,29 +771,96 @@ func (g *Game) newLevel() {
 	newPath = append(newPath, Vec{ScreenW, 300})
 	g.path = newPath
 	// reduce spawn interval slightly to increase challenge
-	if g.spawnInt > 600 {
-		g.spawnInt -= 150
+	if g.spawnInt > SpawnIntervalMin {
+		g.spawnInt -= SpawnIntervalDecay
+		if g.spawnInt < SpawnIntervalMin {
+			g.spawnInt = SpawnIntervalMin
+		}
 	}
 	// set a temporary level message
 	g.levelMsg = fmt.Sprintf("Level %d - New path generated! Next threshold: %d kills", g.level, g.nextLevelThreshold)
 	g.levelMsgTimer = 3000 // show for 3s
+	// start inter-level pause for subsequent levels (skip at initial startup)
+	if g.level > 1 {
+		g.interLevelActive = true
+		g.interLevelTimer = InterLevelPauseMS
+	} else {
+		g.interLevelActive = false
+		g.interLevelTimer = 0
+	}
 }
 
-func genQuestion(r *rand.Rand) *Question {
-	a := 1 + r.Intn(12)
-	b := 1 + r.Intn(12)
-	opi := r.Intn(3)
+func genQuestion(r *rand.Rand, level int) *Question {
+	// difficulty scales with level. We'll pick an operation set and operand ranges.
+	// level 1-2: small add/sub (1..12)
+	// level 3-5: larger add/sub and small mul (1..20)
+	// level 6-9: multiplication up to 12..20 and two-digit add/sub
+	// level 10+: introduce integer division and larger operands
+	var a, b int
 	var op string
 	var ans int
-	if opi == 0 {
-		op = "+"
-		ans = a + b
-	} else if opi == 1 {
-		op = "-"
-		ans = a - b
+	if level <= 2 {
+		a = 1 + r.Intn(12)
+		b = 1 + r.Intn(12)
+		if r.Intn(2) == 0 {
+			op = "+"
+			ans = a + b
+		} else {
+			op = "-"
+			ans = a - b
+		}
+	} else if level <= 5 {
+		a = 1 + r.Intn(20)
+		b = 1 + r.Intn(20)
+		oi := r.Intn(3)
+		if oi == 0 {
+			op = "+"
+			ans = a + b
+		} else if oi == 1 {
+			op = "-"
+			ans = a - b
+		} else {
+			op = "*"
+			ans = a * b
+		}
+	} else if level <= 9 {
+		a = 2 + r.Intn(18) // 2..19
+		b = 2 + r.Intn(18)
+		oi := r.Intn(3)
+		if oi == 0 {
+			op = "+"
+			ans = a + b
+		} else if oi == 1 {
+			op = "-"
+			ans = a - b
+		} else {
+			op = "*"
+			ans = a * b
+		}
 	} else {
-		op = "*"
-		ans = a * b
+		// include integer division: ensure divisible
+		ops := []int{0, 1, 2, 3} // 0:+,1:-,2:*,3:/
+		oi := ops[r.Intn(len(ops))]
+		if oi == 3 {
+			b = 2 + r.Intn(18)
+			q := 2 + r.Intn(12)
+			a = b * q
+			op = "/"
+			ans = a / b
+		} else {
+			a = 5 + r.Intn(45)
+			b = 5 + r.Intn(45)
+			if oi == 0 {
+				op = "+"
+				ans = a + b
+			} else if oi == 1 {
+				op = "-"
+				ans = a - b
+			} else {
+				op = "*"
+				ans = a * b
+			}
+		}
 	}
 	return &Question{Text: fmt.Sprintf("%d %s %d", a, op, b), Ans: ans}
 }
